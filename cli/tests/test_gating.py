@@ -3,10 +3,10 @@ import pytest
 
 from conftest import log_in_as
 
-HIDDEN_NAMES = ("whoami", "access", "requests", "logout", "approve", "revoke", "--version")
+HIDDEN_NAMES = ("whoami", "access", "requests", "logout", "approve", "revoke", "rebuild", "--version")
 
 LOGGED_OUT_DENIED = [
-    ["whoami"], ["logout"], ["--version"], ["nonsense"],
+    ["whoami"], ["logout"], ["--version"], ["nonsense"], ["rebuild", "Vision", "A/1", "--walltime", "01:00"],
     ["access"], ["access", "status"], ["access", "status", "--help"],
     ["requests"], ["requests", "list"], ["requests", "revoke", "7"],
     ["whoami", "--help"], ["help", "whoami"], ["help", "requests"], ["help", "nonsense"],
