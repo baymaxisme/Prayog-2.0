@@ -31,7 +31,15 @@ def test_rebuild_command_uses_existing_rebuild_submission_flow(run, server, caps
     assert "entrypoint" not in body and "hyperparameters" not in body and "version" not in body
     output = capsys.readouterr().out
     assert "a rebuild of A/1" in output
+    assert "prayog project status Vision --run A/2" in output
     assert "prayog project compare Vision A/2" in output
+
+
+@pytest.mark.parametrize("reference", ["A", "A/0", "/1", "A/nope"])
+def test_rebuild_command_rejects_malformed_source_reference(run, server, capsys, reference):
+    assert run("rebuild", "Vision", reference, "--walltime", "02:00") == 2
+    assert "Name the original run like A/1" in capsys.readouterr().err
+    assert not any(request.url.path.endswith("/runs") and request.method == "POST" for request in server.seen)
 
 
 def test_rebuild_command_rejects_invalid_gpu_count_before_submission(run, server, capsys):
