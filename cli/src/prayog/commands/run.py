@@ -1,4 +1,4 @@
-"""`prayog run NAME`: run a project's version on the GPUs."""
+"""\`prayog run NAME\`: run a project's version on the GPUs."""
 import json
 import time
 import uuid
@@ -52,6 +52,10 @@ def run(ctx: Context, args) -> None:
     if args.rebuild and (args.version or args.entrypoint or args.hp):
         raise CliError("A rebuild uses the original run's version, entrypoint and hyperparameters; "
                        "drop --version, --entrypoint and --hp.", USAGE)
+    if args.rebuild:
+        version, separator, number = args.rebuild.partition("/")
+        if not separator or not version.strip() or not number.isdigit() or int(number) < 1:
+            raise CliError("Name the original run like A/1 (version letter, then a positive run number).", USAGE)
     hyperparameters = parse_hyperparameters(args.hp)
     files = dataset.combine([Path(p).expanduser() for p in args.data]) if args.data else []
     client = ctx.client()
@@ -81,6 +85,9 @@ def run(ctx: Context, args) -> None:
             time.sleep(1 + attempt)
     note = f", a rebuild of {queued['rebuild_of']}" if queued.get("rebuild_of") else ""
     print(f"Queued {queued['label']}{note} (job {queued['job_id']}): {queued['gpus']} GPU(s), walltime {queued['walltime']}.")
-    print(f"Follow it with `prayog project status {project['name']}`."
-          + (f" When it finishes, `prayog project compare {project['name']} {queued['version']}/{queued['run_number']}` "
-             "checks it against the original." if args.rebuild else ""))
+    run_ref = f"{queued['version']}/{queued['run_number']}"
+    if args.rebuild:
+        print(f"Follow it with `prayog project status {project['name']} --run {run_ref}`.")
+        print(f"When it finishes, `prayog project compare {project['name']} {run_ref}` checks it against the original.")
+    else:
+        print(f"Follow it with `prayog project status {project['name']} --run {run_ref}`.")
