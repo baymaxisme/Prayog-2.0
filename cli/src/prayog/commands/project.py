@@ -30,6 +30,12 @@ def setup_project(p):
     c.add_argument("-d", "--description", help="what the project is for")
     c.set_defaults(func=create)
 
+    f = sub.add_parser("find", help="find a project and show its ID and version state",
+                       description="Find one of your projects by name and show its server ID, description, "
+                                   "and current/newest uploaded version.")
+    f.add_argument("name", help="the project's name")
+    f.set_defaults(func=find)
+
     c = sub.add_parser("link", help="upload a folder to a project for the first time",
                        description="Upload a folder to a project you created. The server keeps its own copy "
                                    "of the code, configs and seeds, and a fingerprint of each dataset file, "
@@ -126,6 +132,28 @@ def find_project(client: Client, name: str) -> dict:
         if project["name"].lower() == wanted:
             return project
     raise CliError(f"You have no project named '{name}'. Create it first with `prayog project create {name}`.")
+
+
+def find(ctx: Context, args) -> None:
+    client = ctx.client()
+    project = find_project(client, args.name)
+    versions = client.get(f"/mlflow/projects/{project['project_id']}/versions")
+
+    print(f"Project: {project['name']}")
+    print(f"Project ID: {project['project_id']}")
+    if project.get("description"):
+        print(f"Description: {project['description']}")
+    if not versions:
+        print("Versions: none uploaded yet.")
+        print(f"Link a local folder with `prayog project link {project['name']} FOLDER`.")
+        return
+
+    current = next((item["version"] for item in versions if item["is_current"]), None)
+    newest = next((item["version"] for item in versions if item["is_head"]), versions[0]["version"])
+    print(f"Versions: {len(versions)}")
+    print(f"Current version: {current or 'not set'}")
+    print(f"Newest version: {newest}")
+    print(f"See runs with `prayog project status {project['name']}`.")
 
 
 def _ensure_experiment(client: Client, project: dict) -> int:
