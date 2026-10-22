@@ -26,10 +26,11 @@ From this repo: `pip install -e ./cli`. Python 3.9 or newer.
 prayog login -e you@iitk.ac.in -r student
 prayog project create vision                       # a project on the server
 prayog project link vision ./my-folder             # upload the folder: version A
+prayog project find vision                        # show project ID and versions
 prayog run vision --gpus 2 --walltime 04:00 --data ./data --hp lr=0.01
 prayog project status vision                       # watch it: queued, running, results
 prayog project download vision A/1 --to ./out      # the best checkpoint, log and metrics
-prayog run vision --rebuild A/1 --walltime 04:00 --data ./data
+prayog rebuild vision A/1 --walltime 04:00 --data ./data
 prayog project compare vision A/2                  # did it reproduce?
 ```
 
@@ -39,7 +40,7 @@ prayog project compare vision A/2                  # did it reproduce?
 |---|---|
 | Not logged in | `login`, `help`, and `-h`. Every other name is answered with "You are not logged in". |
 | Logged in, any role | `whoami`, `logout`, `help`, `--version` |
-| Student, researcher, professor | `project …`, `run` |
+| Student, researcher, professor | `project …`, `run`, `rebuild` |
 | Student, researcher | `access status`, `access request` |
 | Professor, admin | `requests list`, `requests show`, `requests approve`, `requests reject` |
 | Admin | `requests revoke` |
@@ -121,6 +122,10 @@ Ends an approved user's access. If the user has unfinished jobs the revocation w
 is accepted meanwhile.
 
 ### Project commands
+
+#### `prayog project find NAME`
+Shows the project ID, description, current version, and newest version. If no folder has been linked, it explains how to upload one.
+
 
 A project is the thing you train: a name on the server, plus the versions of your folder uploaded to it and the runs made
 from them. Names are unique among your projects, ignoring upper and lower case, and are matched the same way when you type
@@ -270,6 +275,13 @@ DIR/metrics.json                 every metric value: [{"name", "step", "value"},
 `--checkpoint` chooses which: `best` (default; the last one if none is marked best), `last`, `all`, `none`, or a step
 number. Every file is checked against the size and SHA-256 the server recorded and is saved only if it matches. An existing
 file is never overwritten.
+
+#### `prayog rebuild NAME VERSION/N --walltime HH:MM [--gpus N] [--data PATH]…`
+A focused command for reproducing a finished run, such as `A/1`. It reuses the original version, entrypoint and hyperparameters. Supply the original dataset files with `--data`; their BLAKE3 fingerprints must match. The GPU count and walltime can be changed. The existing `prayog run NAME --rebuild VERSION/N` form remains supported.
+
+```bash
+prayog rebuild vision A/1 --walltime 04:00 --data ./data
+```
 
 #### `prayog run NAME --rebuild V/N`
 Reproduces a finished run, such as `A/1`. The rebuild uses the original's version, entrypoint and hyperparameters (so
