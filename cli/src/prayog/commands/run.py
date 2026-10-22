@@ -1,4 +1,4 @@
-"""\`prayog run NAME\`: run a project's version on the GPUs."""
+"""Run a project's version on the GPUs."""
 import json
 import time
 import uuid
