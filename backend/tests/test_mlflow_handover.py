@@ -63,7 +63,7 @@ class ProjectHandoverTests(unittest.TestCase):
         self.db.commit.assert_not_called()
 
     def test_failed_artifact_verification_blocks_ownership_transfer(self):
-        project = SimpleNamespace(user_id=self.owner.id)
+        project = SimpleNamespace(project_id=self.pending.project_id, user_id=self.owner.id)
         self.db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = project
         with patch("logic.mlflow_handover._handover_for_decision", return_value=(self.pending, self.profile)), patch(
             "logic.mlflow_handover._verify_inventory", return_value=["artifact-7"]
@@ -76,7 +76,7 @@ class ProjectHandoverTests(unittest.TestCase):
         self.db.commit.assert_called_once()
 
     def test_approved_handover_transfers_project_and_child_metadata(self):
-        project = SimpleNamespace(user_id=self.owner.id)
+        project = SimpleNamespace(project_id=self.pending.project_id, user_id=self.owner.id)
         self.db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = project
         self.db.query.return_value.filter.return_value.all.return_value = []
         with patch("logic.mlflow_handover._handover_for_decision", return_value=(self.pending, self.profile)), patch(
