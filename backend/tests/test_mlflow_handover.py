@@ -76,9 +76,23 @@ class ProjectHandoverTests(unittest.TestCase):
         self.db.commit.assert_called_once()
 
     def test_approved_handover_transfers_project_and_child_metadata(self):
+        from sqlalchemy import select
+        from mlflow_models import ModelRun
+
         project = SimpleNamespace(project_id=self.pending.project_id, user_id=self.owner.id)
-        self.db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = project
-        self.db.query.return_value.filter.return_value.all.return_value = []
+
+        def query_for(model):
+            query = MagicMock()
+            filtered = MagicMock()
+            filtered.all.return_value = []
+            filtered.with_for_update.return_value.first.return_value = project
+            filtered.update.return_value = 1
+            query.filter.return_value = filtered
+            if model is ModelRun.id:
+                query.filter.return_value = select(ModelRun.id)
+            return query
+
+        self.db.query.side_effect = query_for
         with patch("logic.mlflow_handover._handover_for_decision", return_value=(self.pending, self.profile)), patch(
             "logic.mlflow_handover._verify_inventory", return_value=[]
         ):
