@@ -76,8 +76,11 @@ class SchedulerReaperTests(SchedulerPostgresCase):
             self.db, [unit.id], starts, starts + timedelta(hours=1),
             "Scheduled repair", confirm=True, now=self.now,
         )
+        reap_at = self.now + timedelta(minutes=2)
+        node.last_heartbeat_at = reap_at
+        self.db.commit()
 
-        result = reaper.reap(self.db, now=self.now + timedelta(minutes=2))
+        result = reaper.reap(self.db, now=reap_at)
 
         self.assertEqual(result.stops_requested[job.id], ReleaseReason.MAINTENANCE)
         self.db.refresh(allocation)

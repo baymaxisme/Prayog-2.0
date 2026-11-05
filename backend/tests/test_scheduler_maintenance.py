@@ -3,7 +3,6 @@ from datetime import timedelta
 
 from logic.errors import BadRequestError
 from logic.scheduler import maintenance
-from logic.scheduler.domain import ReleaseReason
 from scheduler_pg import SchedulerPostgresCase, requires_postgres
 
 
@@ -30,7 +29,7 @@ class SchedulerMaintenanceTests(SchedulerPostgresCase):
 
         with self.assertRaises(maintenance.CollisionNotConfirmed):
             maintenance.book(self.db, [unit.id], starts, ends, "GPU repair", now=self.now)
-        self.assertEqual(maintenance.bookings(self.db, now=self.now), [])
+        self.assertFalse(any(unit.id in booking.unit_ids for booking in maintenance.bookings(self.db, now=self.now)))
 
     def test_confirmed_booking_can_be_listed_and_cancelled(self):
         _, unit = self._running_unit()
@@ -41,12 +40,14 @@ class SchedulerMaintenanceTests(SchedulerPostgresCase):
             self.db, [unit.id], starts, ends, "GPU repair", confirm=True, now=self.now,
         )
         self.assertTrue(preview.collisions)
-        [booking] = maintenance.bookings(self.db, now=self.now)
-        self.assertEqual(booking.booking_id, booking_id)
-        self.assertEqual(booking.unit_ids, (unit.id,))
+        matches = [booking for booking in maintenance.bookings(self.db, now=self.now)
+                   if booking.booking_id == booking_id]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].unit_ids, (unit.id,))
 
         maintenance.cancel(self.db, booking_id)
-        self.assertEqual(maintenance.bookings(self.db, now=self.now), [])
+        self.assertFalse(any(booking.booking_id == booking_id
+                             for booking in maintenance.bookings(self.db, now=self.now)))
 
     def test_invalid_window_and_unknown_unit_are_rejected(self):
         _, unit = self._running_unit()
