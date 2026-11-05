@@ -75,6 +75,22 @@ class ProjectHandoverTests(unittest.TestCase):
         self.assertEqual(project.user_id, self.owner.id)
         self.db.commit.assert_called_once()
 
+    def test_approved_handover_transfers_project_and_child_metadata(self):
+        project = SimpleNamespace(user_id=self.owner.id)
+        self.db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = project
+        self.db.query.return_value.filter.return_value.all.return_value = []
+        with patch("logic.mlflow_handover._handover_for_decision", return_value=(self.pending, self.profile)), patch(
+            "logic.mlflow_handover._verify_inventory", return_value=[]
+        ):
+            result = approve_handover(self.db, "handover-1", self.professor)
+
+        self.assertIs(result, self.pending)
+        self.assertEqual(project.user_id, self.professor.id)
+        self.assertEqual(self.pending.status, "HANDOVER_APPROVED")
+        self.assertIsNotNone(self.pending.decided_at)
+        self.db.commit.assert_called_once()
+        self.db.refresh.assert_called_once_with(self.pending)
+
     def test_handover_endpoints_are_registered(self):
         paths = {route.path for route in router.routes}
         self.assertIn("/mlflow/projects/{project_id}/handover", paths)
