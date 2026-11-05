@@ -62,6 +62,19 @@ class ProjectHandoverTests(unittest.TestCase):
                 approve_handover(self.db, "handover-1", self.professor)
         self.db.commit.assert_not_called()
 
+    def test_failed_artifact_verification_blocks_ownership_transfer(self):
+        project = SimpleNamespace(user_id=self.owner.id)
+        self.db.query.return_value.filter.return_value.with_for_update.return_value.first.return_value = project
+        with patch("logic.mlflow_handover._handover_for_decision", return_value=(self.pending, self.profile)), patch(
+            "logic.mlflow_handover._verify_inventory", return_value=["artifact-7"]
+        ):
+            with self.assertRaisesRegex(ConflictError, "Artifact verification failed"):
+                approve_handover(self.db, "handover-1", self.professor)
+
+        self.assertEqual(self.pending.failed_artifacts, ["artifact-7"])
+        self.assertEqual(project.user_id, self.owner.id)
+        self.db.commit.assert_called_once()
+
     def test_handover_endpoints_are_registered(self):
         paths = {route.path for route in router.routes}
         self.assertIn("/mlflow/projects/{project_id}/handover", paths)
