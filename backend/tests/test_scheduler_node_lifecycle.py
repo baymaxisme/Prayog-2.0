@@ -56,3 +56,25 @@ class SchedulerNodeLifecycleTests(SchedulerPostgresCase):
         self.db.refresh(node)
         self.assertEqual(node.unit_count, 1)
         self.assertEqual(len([u for u in self.units_of(node) if u.retired_at is None]), 1)
+
+    def test_admin_node_routes_are_role_protected_and_apply_state_changes(self):
+        admin = self.make_user("node-admin", role="ADMIN")
+        ordinary = self.make_user("node-user")
+        payload = {
+            "name": f"route-node-{self.suffix}",
+            "owner_lab_id": self.lab.id,
+            "donation_mode": "shared",
+            "teaching_pool": False,
+            "unit_count": 2,
+        }
+        self.assertEqual(self.client_as(ordinary).post("/admin/nodes", json=payload).status_code, 403)
+
+        client = self.client_as(admin)
+        registered = client.post("/admin/nodes", json=payload)
+        self.assertEqual(registered.status_code, 201, registered.text)
+        node_id = registered.json()["node"]["id"]
+        self.assertEqual(registered.json()["node"]["state"], NodeState.PENDING_AGENT)
+
+        drained = client.post(f"/admin/nodes/{node_id}/drain", json={"mode": "soft", "reason": "Repair"})
+        self.assertEqual(drained.status_code, 200, drained.text)
+        self.assertEqual(drained.json()["state"], NodeState.DRAINING)
