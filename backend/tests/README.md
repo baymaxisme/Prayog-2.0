@@ -76,7 +76,6 @@ The current test modules cover:
 - `test_mlflow_snapshot_storage_failures.py`
 - `test_mlflow_worker.py`
 - `test_mlflow_worker_docker.py`
-- `test_node_agents.py`
 - `test_steward_context.py`
 
 ## Important limitations
