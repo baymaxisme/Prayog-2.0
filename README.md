@@ -1,414 +1,299 @@
 # Prayog
 
-Prayog is an IIT Kanpur research-platform project. This repository currently contains the **FastAPI backend** for user access, research-project management, ML experiment tracking, artifact storage, reproducible rebuilds, and controlled compute-node enrollment.
+**Prayog** is a shared GPU platform for IIT Kanpur. Students and researchers sign in with their IITK accounts and get access approved by their professor and an admin. They then submit GPU jobs to a fair-share scheduler that runs them on lab-owned GPU nodes. When a run fails, an AI agent called the **Steward** diagnoses the failure and suggests fixes.
 
-The main workflow is to create a project and model, track experiments and runs, store verifiable code/weight/log artifacts, record immutable run snapshots, and request isolated rebuilds from those snapshots. The backend also provides role-restricted administrative and professor views, project handover, and guarded event handoff for future AI services.
+> CS455 (Introduction to Software Engineering), IIT Kanpur, Group 3. This is an ongoing course project: see [Status](#status) for what works today and what is still in progress.
 
-> **Scope note:** This repository is backend-focused. It does not currently contain a frontend application, a production GPU scheduler, or configured live Steward/optimization services. The AI integration contract and safety gates are implemented, but production service-to-service transport and downstream AI consumers are not configured.
+---
 
 ## Contents
 
-- [Capabilities](#capabilities)
+- [What it does](#what-it-does)
 - [Architecture](#architecture)
 - [Repository layout](#repository-layout)
-- [Requirements](#requirements)
-- [Local setup](#local-setup)
-- [Run the API](#run-the-api)
-- [Create the first administrator](#create-the-first-administrator)
-- [ML Flow quick start](#ml-flow-quick-start)
-- [Run the execution worker](#run-the-execution-worker)
-- [Artifact storage](#artifact-storage)
-- [Node-agent enrollment](#node-agent-enrollment)
-- [Tests](#tests)
-- [Configuration reference](#configuration-reference)
-- [Security and operational notes](#security-and-operational-notes)
-- [Detailed documentation](#detailed-documentation)
+- [Getting started](#getting-started)
+- [Running the platform](#running-the-platform)
+- [Trying it end to end](#trying-it-end-to-end)
+- [Configuration](#configuration)
+- [API overview](#api-overview)
+- [Status](#status)
+- [Further documentation](#further-documentation)
 
-## Capabilities
+---
 
-### Accounts and access control
-- User authentication using bearer JWTs and database-backed roles.
-- Role-protected administrative and professor endpoints.
-- Access-request and professor-related APIs.
-- User-owned ML Flow resources; attempts to access another user's resources are scoped as not found.
+## What it does
 
-### ML Flow experiment lifecycle
-- Separate user-owned projects and models, with experiments belonging to both.
-- Execution runs, hyperparameters, environment metadata, and metrics.
-- Individual metric logging and atomic metric batches.
-- Code, weights, and log artifact uploads with server-computed integrity metadata.
-- Immutable snapshots with explicit `RECORDED` or `INCOMPLETE` status.
-- Run resubmission from a completed run with a verified reusable code artifact.
-- Snapshot-based rebuild attempts, status history, and metric comparison.
-
-### Reproducibility and artifact safety
-- Content-addressed artifact storage with integrity verification.
-- Local storage and S3-compatible object storage modes.
-- Project snapshot packaging with file inventory and chunk reuse.
-- Archive path, symlink, entrypoint, and output-file validation.
-- Private artifact retrieval; artifacts are not exposed as static public files.
-
-### Worker execution
-- A separate worker process claims queued first-time runs and rebuild attempts.
-- User code executes in a restricted Docker container, not in the API process.
-- Worker claims, stale-claim recovery, bounded logs, timeouts, and queue ordering.
-- Optional node capability inventory checks to fail fast when no provisioned node can satisfy a job's declared requirements.
-
-### Administration and guarded AI handoff
-- Admin-only node-agent enrollment-token issuance, node listing, and credential revocation.
-- Project IP handover with artifact inventory verification.
-- Professor-facing, read-only experiment metadata views.
-- Transactional outbox events with leased delivery, retries, and idempotency safeguards.
-- Steward diagnosis eligibility only after a persisted failed rebuild with a verified log; optimization eligibility only after a persisted successful rebuild.
-
-The outbox is a handoff mechanism, not a live AI integration. No configured production Steward client, optimization service, or service-to-service transport is included.
+| Area | What it does |
+|---|---|
+| **Authentication** | Self-registration for `@iitk.ac.in` students and researchers; JWT login (60-minute tokens); Argon2 password hashing. Professors are added by an admin; the first admin is created by a script. |
+| **Authorisation** | Users request access, saying whether it is for a course project or for research (`purpose`). A request needs the approval of **both** their professor and an admin before it takes effect. Admins can revoke approved access, and a student's access ends automatically after their end date. If the user still has unfinished GPU jobs, the revoke waits for them to finish. Roles: `STUDENT`, `RESEARCHER`, `PROFESSOR`, `ADMIN`. |
+| **GPU scheduling** | Jobs ask for a number of GPUs on one node and a walltime (`HH:MM`). A scheduler places them using **priority classes** (P0: your own lab's node, P1/P2: another lab's shared node, P3: teaching pool for course jobs), then a **fair-share score** inside each class (waiting time, recent usage with a 7-day half-life, lab contribution, job size). Retried submissions with the same `client_request_id` are idempotent. Course accounts have a GPU-hour quota. |
+| **Node management** | Admins register nodes; each node's agent enrols with a one-time token, then heartbeats, pulls its allocations, and reports how each run ended. Nodes can be drained, returned, decommissioned, and booked for maintenance windows. A reaper marks silent nodes down and requeues their jobs. |
+| **Steward (AI agent)** | **S1** diagnoses failed runs and may propose a corrected job (more GPUs or walltime) that the owner approves. **S2** warns admins when failures from several users point at the same GPU. **S3** gives a single-use chat link after a failed rebuild. **S4** gives optimisation advice after a successful rebuild, citing reference papers. The Steward only reads and reasons; the server validates and writes every record. |
+| **Experiment Ledger (ML Flow)** | Projects, models, experiments and runs; metrics streamed during a run; content-addressed artifacts verified on upload; a snapshot sealed automatically at the end of a run (RECORDED, or INCOMPLETE with reasons); an outbox and idempotent ledger consumer; read-only Professor and admin views; IP handover to the supervising Professor; rebuilds from a Snapshot ID (`prayog run --rebuild`). See [backend/ML_FLOW.md](backend/ML_FLOW.md). |
+| **Monitoring** | `GET /health` (API and database) and `GET /metrics` (scheduler counts in Prometheus format). |
 
 ## Architecture
 
-```text
-Client / CLI
-    |
-    | HTTPS + Prayog user JWT
-    v
-FastAPI application (backend/main.py)
-    |
-    +-- Routers: authentication, access requests, ML Flow,
-    |             professor/admin views, handover, node agents
-    |
-    +-- Logic layer: ownership checks, lifecycle transitions,
-    |                artifact verification, authorization
-    |
-    +-- SQLAlchemy models + Alembic migrations
-    |                 |
-    |                 v
-    |              PostgreSQL
-    |
-    +-- Artifact storage: private local volume or S3-compatible bucket
-    |
-    +-- Transactional outbox
-                      |
-                      v
-             Separate outbox dispatcher
-             (requires configured handler module)
+Prayog runs as a few separate processes that share one PostgreSQL database:
 
-Separate ML Flow execution worker
-    |
-    +-- Claims queued run/rebuild work from PostgreSQL
-    +-- Reads verified artifacts from configured storage
-    +-- Runs project code in a restricted Docker container
-    +-- Persists execution result, logs, and output artifacts
+```
+                ┌──────────────────────────┐
+  users ───────▶│  API  (FastAPI, :8000)   │◀────── node agents
+  (JWT)         │  auth · access · jobs ·  │        (one per GPU node,
+                │  admin · /steward/*      │         X-Node-Credential)
+                └────────────┬─────────────┘
+                             │
+   ┌─────────────────────────┼───────────────────────────┐
+   │                         ▼                           │
+   │  Scheduler tick    PostgreSQL 16      Steward worker│
+   │  (reaper + passes) platform tables +  (diagnoses,   │
+   │                    steward schemas    correlation,  │
+   │                    (row-level         retention)    │
+   │                     security)              │        │
+   └────────────────────────────────────────────┼────────┘
+                                                ▼
+                                  Steward Runtime (:8100)
+                                  model adapter: Claude /
+                                  heuristic / stub
+                                  (no database access)
 ```
 
-The API, execution worker, and outbox dispatcher are separate processes. In local artifact-storage mode, the API and execution worker must share the same private durable artifact directory. In S3 mode, both require the same bucket configuration and authorized credentials.
+- **API** (`backend/main.py`): all HTTP endpoints. A scheduling pass also runs in the background after each job submission.
+- **Scheduler tick** (`backend/logic/scheduler/run.py`): a safety-net pass every 10 seconds, plus the reaper for timeouts, stops and dead nodes.
+- **Steward worker** (`backend/integration/steward_worker.py`): picks up Steward tasks, calls the Runtime, validates the answer and stores the diagnosis.
+- **Steward Runtime** (`steward/src/steward_runtime`): the only part that talks to a model. It holds no database credentials, and import-linter rules forbid it from importing server code.
+- **Node agent** (`backend/node_agent/simulated.py`): runs on each GPU node. The one in this repo uses a *simulated* executor, so the whole system can be run on a laptop without GPUs.
+
+The Steward is optional. If it is disabled or not set up, the platform runs without it and scheduling is unaffected.
 
 ## Repository layout
 
-| Path | Purpose |
-|---|---|
-| `backend/main.py` | FastAPI application, middleware, exception handling, router registration, health endpoint |
-| `backend/routers/` | HTTP routes for authentication, access requests, ML Flow, handover, professors, administration, and node agents |
-| `backend/logic/` | Business logic, lifecycle rules, authorization, artifact storage, outbox, and diagnostic safeguards |
-| `backend/schemas/` | Request and response schemas |
-| `backend/models.py`, `backend/mlflow_models.py`, `backend/node_agent_models.py` | Database models |
-| `backend/alembic/` | Database migration environment and migration history |
-| `backend/mlflow_cli.py` | Command-line client for ML Flow API workflows |
-| `backend/mlflow_worker.py` | Separate Docker-backed run/rebuild execution worker |
-| `backend/mlflow_outbox_worker.py` | Transactional outbox dispatcher |
-| `backend/worker/Dockerfile` | Default Python runtime image for isolated project execution |
-| `backend/scripts/create_admin.py` | Initial administrator bootstrap |
-| `backend/tests/` | Backend automated tests and test-suite instructions |
-| `backend/ML_FLOW.md` | Detailed lifecycle, CLI, worker, artifact, and API guide |
-| `backend/AI_INTEGRATION.md` | Steward/optimization eligibility and outbox contract |
-| `backend/NODE_AGENT_ENROLLMENT.md` | Node-agent enrollment and authentication guide |
-| `docker-compose.yml` | Local PostgreSQL service |
+```
+Prayog/
+├── docker-compose.yml          PostgreSQL 16 (+ Steward Runtime image)
+├── .env.example                every setting, with comments; copy to .env
+├── API.md                      API reference: health, auth, professors, access requests
+├── API_STEWARD.md              API reference: rebuilds and /steward/*
+├── backend/
+│   ├── main.py                 FastAPI app, routers, /health
+│   ├── database.py             SQLAlchemy engine from POSTGRES_* settings
+│   ├── models.py               all platform tables
+│   ├── alembic/                platform migrations (the only way tables are created)
+│   ├── routers/                HTTP layer: auth, professors, access_requests, rebuilds,
+│   │   └── scheduler/          jobs, admin (nodes, alerts, maintenance), agent, metrics
+│   ├── schemas/                Pydantic request/response models
+│   ├── logic/                  business rules; routers stay thin
+│   │   ├── auth.py, access_request.py, admin.py, dependencies.py, errors.py, rebuild.py
+│   │   └── scheduler/          classes, scoring, eligibility, passes, claim, dispatch,
+│   │                           lifecycle, reaper, nodes, maintenance, metrics, config, run
+│   ├── integration/            steward_bridge.py (the only module that knows both
+│   │                           sides), steward_worker.py
+│   ├── node_agent/             simulated node agent
+│   ├── scripts/                create_admin, seed_dev, setup_steward
+│   └── requirements.txt
+└── steward/                    the Steward, an installable package (prayog-steward)
+    ├── DESIGN.md               design, security model and decisions
+    ├── pyproject.toml
+    ├── Dockerfile
+    ├── src/
+    │   ├── steward_contracts/  Pydantic contracts shared by server and Runtime
+    │   ├── prayog_steward/     server side: hooks, gateway, sanitiser, sessions, API, CLI
+    │   └── steward_runtime/    model adapters: Claude, heuristic, stub
+    ├── knowledge/              seed list of arXiv papers for the knowledge base
+    ├── eval/                   S1 evaluation cases
+    └── tools/evaluate.py       S1 accuracy evaluation
+```
 
-## Requirements
+## Getting started
 
-- Python 3.10 or newer (the worker's default runtime image is Python 3.12).
-- PostgreSQL 16 for the supplied local Docker Compose configuration.
-- Docker Engine for isolated run/rebuild execution.
-- Git.
-- An S3-compatible object store and AWS SDK credentials only if S3 artifact storage is selected.
+### Prerequisites
 
-The API can be developed and its unit tests can be run without starting the Docker execution worker. PostgreSQL is required for a functional local API and database-backed integration tests. Docker is required to execute submitted project archives through the worker.
+- Python **3.11+** (tested on 3.12 and 3.13)
+- PostgreSQL **15+**. The easiest way is Docker, using `docker-compose.yml`.
+- Git
 
-## Local setup
-
-### 1. Clone the repository
+### 1. Clone and install
 
 ```bash
-git clone https://github.com/baymaxisme/Prayog.git
+git clone https://github.com/Dishaswamy/Prayog.git
 cd Prayog
-```
-
-Switch to the branch you intend to work on if it is not the repository's default branch.
-
-### 2. Configure environment variables
-
-Create a root-level `.env` file. Do not commit it.
-
-```dotenv
-POSTGRES_USER=prayog
-POSTGRES_PASSWORD=replace-with-a-strong-local-password
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_DB=prayog
-JWT_SECRET_KEY=replace-with-a-long-random-secret
-```
-
-The database module requires the PostgreSQL username, password, host, database name, and JWT secret. The port defaults to `5432` in the Python database configuration; Docker Compose uses `POSTGRES_PORT` for the host port mapping, so define it in `.env` when using the supplied Compose file.
-
-Generate a strong, unique JWT secret for each environment. Do not reuse a production secret in development or tests.
-
-### 3. Start PostgreSQL
-
-From the repository root:
-
-```bash
-docker compose up -d postgres
-docker compose ps
-```
-
-The Compose service persists database data in the `postgres_data` named volume.
-
-### 4. Install backend dependencies
-
-```bash
-cd backend
 python -m venv .venv
 ```
 
-Activate the virtual environment:
-
-Windows PowerShell:
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
-
-Linux/macOS:
+Activate the environment and install the backend and the Steward package. The backend imports the Steward, so install both even if you plan to run with `STEWARD_ENABLED=false`.
 
 ```bash
+# Linux / macOS
 source .venv/bin/activate
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
+
+pip install -r backend/requirements.txt -e ./steward
 ```
 
-Install dependencies:
+### 2. Configure
 
 ```bash
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+cp .env.example .env        # Windows: copy .env.example .env
 ```
 
-### 5. Apply database migrations
+Then edit `.env`. At minimum, set:
 
-From the `backend` directory:
+- `POSTGRES_PASSWORD`
+- `JWT_SECRET_KEY`, a long random string. For example: `python -c "import secrets; print(secrets.token_urlsafe(48))"`
+- `STEWARD_DB_PASSWORD`, which must differ from the Postgres password.
+
+`.env` is git-ignored. Never commit it.
+
+### 3. Start PostgreSQL
 
 ```bash
-alembic upgrade head
+docker compose up -d postgres
 ```
 
-Use Alembic migrations to create and evolve the schema. Do not use ad hoc table creation as a substitute for applying the migration history.
+### 4. Create the tables
 
-## Run the API
-
-Start the development server from the `backend` directory:
+All remaining commands run from `backend/`:
 
 ```bash
-uvicorn main:app --reload
+cd backend
+python -m alembic upgrade head        # platform tables
+python -m scripts.setup_steward       # Steward role, schemas and grants (skip if STEWARD_ENABLED=false)
 ```
 
-Default local URLs:
+`setup_steward` creates a separate, restricted database role for the Steward (`NOSUPERUSER NOBYPASSRLS`), so that row-level security on users' diagnostic data is enforced.
 
-- API base: `http://localhost:8000`
-- Interactive Swagger UI: `http://localhost:8000/docs`
-- OpenAPI schema: `http://localhost:8000/openapi.json`
-- Health check: `http://localhost:8000/health`
+### 5. Create users
 
-The health endpoint checks database connectivity. It returns HTTP 200 when the database is reachable and HTTP 503 when it is not.
-
-The configured development CORS origins are `http://localhost:3000` and `http://localhost:5173`. Update the application configuration deliberately when connecting a different frontend origin; do not use unrestricted origins in production.
-
-## Create the first administrator
-
-Self-registration does not allow a user to assign themselves the `ADMIN` role. After applying migrations, create the initial administrator from the `backend` directory:
+For a quick development setup with sample data:
 
 ```bash
-python -m scripts.create_admin admin@iitk.ac.in "replace-with-a-strong-password"
+python -m scripts.seed_dev
 ```
 
-Use an authorized administrator account and a secure local environment. This bootstrap command accepts the password as a process argument, so avoid running it on shared machines or where command-line arguments are exposed. Do not include real credentials in shell transcripts or documentation.
+This creates `admin@iitk.ac.in`, `prof@iitk.ac.in`, `prof2@iitk.ac.in`, `alice@iitk.ac.in` (student, lab *vision*) and `bob@iitk.ac.in` (researcher, lab *nlp*). Each test account's password is its user ID reversed (`alice` signs in with `ecila`). Alice's and Bob's access is already approved. It also creates nodes `n1`, `n2` and the teaching-pool node `t1`, with 4 GPUs each, and prints the command that starts each node's agent. Use it for development only: these passwords are public.
 
-## ML Flow quick start
-
-The CLI is an API client. It does not execute submitted project code itself.
-
-Set the API URL and an existing Prayog bearer token in the environment:
-
-Linux/macOS:
+Or, to create just the first admin:
 
 ```bash
-export PRAYOG_API_URL=http://localhost:8000
-export PRAYOG_TOKEN="your-user-bearer-token"
+python -m scripts.create_admin admin@iitk.ac.in "StrongPassword123"
 ```
 
-Windows PowerShell:
+## Running the platform
 
-```powershell
-$env:PRAYOG_API_URL = "http://localhost:8000"
-$env:PRAYOG_TOKEN = "your-user-bearer-token"
-```
-
-From `backend`, inspect the available commands:
+Run each process in its own terminal, from `backend/`, with the virtual environment active:
 
 ```bash
-python mlflow_cli.py --help
+uvicorn main:app --port 8000                                     # API  → http://127.0.0.1:8000/docs
+python -m logic.scheduler.run                                    # scheduler tick
+python -m integration.steward_worker                             # Steward worker
+uvicorn steward_runtime.app:app --port 8100 --env-file ../.env   # Steward Runtime
 ```
 
-The CLI supports project/model/experiment creation, run creation and start/finish, artifact upload/download, metric logging, snapshot operations, rebuild requests and status, resubmission, and result synchronization. For a complete command reference and end-to-end examples, see [backend/ML_FLOW.md](backend/ML_FLOW.md).
+The Runtime uses the rule-based `heuristic` adapter by default, so no API key is needed. To use Claude, set `STEWARD_REASONING=claude` and `ANTHROPIC_API_KEY` in `.env`.
 
-A typical lifecycle is:
+The web app is at http://127.0.0.1:8000/ (it redirects to `/app/`). It needs no build step, and each role sees its own workspace:
 
-1. Create a project.
-2. Create a model within that project.
-3. Create an experiment linked to the project and model.
-4. Create a run and record its hyperparameters/environment.
-5. Upload a code archive and optional input weights.
-6. Start the run. Supplying a verified code artifact ID queues it for the separate worker; omitting it retains the caller-managed execution flow.
-7. Record metrics while the run is running.
-8. Finish the run and inspect its snapshot.
-9. Rebuild only from a verified `RECORDED` snapshot.
-10. Inspect the rebuild result and compare metrics where required.
+- **Students and Researchers:** the researcher dashboard (jobs, quota, projects, versions, runs with metric charts, rebuild comparison, IP handover) and GPU access requests.
+- **Professors:** the read-only workspace for the people they supervise, handover review and access requests.
+- **Admins:** the read-only pool picture with the audit log, node operations, maintenance windows, the ledger overview, access requests and Professor accounts.
+- **The Steward's screens** appear for each role when the Steward is running ([steward/DESIGN.md](steward/DESIGN.md#2-setup-and-running)).
 
-A snapshot may be `INCOMPLETE` if required or supplied artifacts or declared expected metrics are missing or fail verification. Incomplete snapshots remain inspectable but cannot be rebuilt. Terminal run state and snapshot completeness are separate concepts.
+The code is in `backend/web/`, plain JavaScript modules served by the API. Uploading a version or a dataset stays in the CLI, which fingerprints the files.
 
-## Run the execution worker
+Shortcuts for development:
 
-Build the default runtime image from the repository root:
+- `STEWARD_INPROCESS_REASONING=heuristic` runs the model adapter inside the API, so you can skip starting the Runtime.
+- `STEWARD_ENABLED=false` runs the platform without the Steward. You then only need the API and the scheduler tick.
+
+Check that everything is up:
 
 ```bash
-docker build -t prayog-ml-runtime:python3.12 -f backend/worker/Dockerfile backend/worker
+curl http://127.0.0.1:8000/health
+# {"status":"ok","database":"ok"}
 ```
 
-Then, in a separate terminal, run the worker from the `backend` directory with the same database and artifact-storage configuration as the API:
+## Trying it end to end
 
-```bash
-python mlflow_worker.py
-```
+1. **Start a node agent.** Use the command printed by `seed_dev`, which looks like this:
 
-To process at most one queued job and exit:
+   ```bash
+   python -m node_agent.simulated --units 4 --state-dir .agent-n1 --enrolment-token <token>
+   ```
 
-```bash
-python mlflow_worker.py --once
-```
+   Its first heartbeat makes the node `AVAILABLE`. On later starts the stored credential is used, so the token isn't needed again.
 
-The worker handles queued first-time runs and snapshot rebuilds. It validates submitted archives and executes them in restricted Docker containers. The API process does not run user-submitted code.
+2. **Log in and submit a job:**
 
-The worker requires access to a Docker daemon. Treat it as a trusted platform service. Do not expose the Docker socket to submitted project containers. The default runtime image does not install arbitrary project dependencies or access the public network; add reviewed dependencies to an administrator-managed runtime image instead.
+   ```bash
+   curl -X POST http://127.0.0.1:8000/auth/login -H "Content-Type: application/json" \
+        -d '{"email": "alice@iitk.ac.in", "password": "ecila", "role": "STUDENT"}'
 
-For worker timeout, image, archive, recovery, node-capability, and security details, see [backend/ML_FLOW.md](backend/ML_FLOW.md).
+   curl -X POST http://127.0.0.1:8000/jobs -H "Authorization: Bearer <token>" \
+        -H "Content-Type: application/json" \
+        -d '{"gpus": 2, "walltime": "01:00", "client_request_id": "try-1"}'
 
-## Artifact storage
+   curl http://127.0.0.1:8000/jobs/<request_id> -H "Authorization: Bearer <token>"
+   ```
 
-Local storage is the default. Configure `PRAYOG_ARTIFACT_ROOT` to a private, durable directory writable by the API and worker. The default is `backend/artifacts`. In local mode, every API/worker instance that handles the same jobs must share that private volume.
+   The job moves through `IN_PROCESS` → `QUEUED` → `SCHEDULED` → `RUNNING` → finished. A simulated job runs for 30 seconds by default (`--run-seconds`).
 
-For S3-compatible storage, configure:
+3. **See a Steward diagnosis.** Start an agent with `--exit-code 1 --log-file run.log`. Every job on that node then fails and reports the contents of `run.log` as its log. The Steward worker diagnoses the failure, and the owner can read it at `GET /steward/runs/{run_id}/diagnoses`.
 
-- `PRAYOG_ARTIFACT_STORAGE=s3`
-- `PRAYOG_S3_BUCKET`
-- Optional `PRAYOG_S3_PREFIX` (default: `prayog-artifacts`)
-- Optional `PRAYOG_S3_REGION` or `AWS_DEFAULT_REGION`
-- Optional `PRAYOG_S3_ENDPOINT_URL` for compatible providers
-- Optional `PRAYOG_S3_SERVER_SIDE_ENCRYPTION` (default: `AES256`)
+The interactive API docs at `http://127.0.0.1:8000/docs` are the easiest way to try every endpoint.
 
-Credentials are resolved through the standard AWS SDK credential chain. Keep the bucket private, block public access, enforce TLS, and restrict access to the API/worker identities. In S3 mode, `PRAYOG_ARTIFACT_ROOT` is a local cache/staging directory, not the source of truth.
+## Configuration
 
-After configuring storage, run the storage smoke check from `backend`:
+All settings come from `.env`, and `.env.example` documents each one.
 
-```bash
-python mlflow_storage_smoke.py
-```
-
-This check exercises temporary upload, download/checksum verification, and cleanup; it does not create ML Flow database records.
-
-## Node-agent enrollment
-
-The backend includes admin-controlled node-agent enrollment and authenticated heartbeat endpoints. It does **not** implement a complete GPU scheduler or hardware allocation service.
-
-The enrollment flow is:
-
-1. An administrator issues a node-specific, one-time enrollment token using `POST /node-agents/enrollment-tokens`.
-2. The node exchanges that token at `POST /node-agents/enroll` for a node-scoped credential.
-3. The node authenticates each heartbeat request using that credential.
-4. An administrator can list enrolled agents with `GET /node-agents` and revoke a credential with `POST /node-agents/{node_id}/revoke`.
-
-Enrollment tokens expire after 15 minutes and are single-use. The server stores hashes of enrollment tokens and node credentials, not their raw values. See [backend/NODE_AGENT_ENROLLMENT.md](backend/NODE_AGENT_ENROLLMENT.md) for request examples and security details.
-
-## Tests
-
-From the `backend` directory, install the requirements and run:
-
-```bash
-python -m pytest tests/
-```
-
-For a concise summary:
-
-```bash
-python -m pytest tests/ -q
-```
-
-To run a specific module:
-
-```bash
-python -m pytest tests/test_auth_dependencies.py
-```
-
-The tests include unit-level checks and selected integration-oriented workflows. A passing unit-test run does not by itself validate a production PostgreSQL deployment, S3 permissions, Docker isolation, real GPU execution, or live downstream AI services. See [backend/tests/README.md](backend/tests/README.md) for the test inventory, commands, and limitations.
-
-## Configuration reference
-
-| Variable | Purpose |
+| Group | Variables |
 |---|---|
-| `POSTGRES_USER` | PostgreSQL username (required) |
-| `POSTGRES_PASSWORD` | PostgreSQL password (required) |
-| `POSTGRES_HOST` | PostgreSQL host (required) |
-| `POSTGRES_PORT` | PostgreSQL port; Python defaults to `5432`, Compose uses this for host mapping |
-| `POSTGRES_DB` | PostgreSQL database name (required) |
-| `JWT_SECRET_KEY` | Secret used to validate/sign user JWTs (required by authentication logic) |
-| `PRAYOG_ARTIFACT_ROOT` | Private artifact/cache directory; defaults to `backend/artifacts` |
-| `PRAYOG_ARTIFACT_STORAGE` | Artifact backend: `local` (default) or `s3` |
-| `PRAYOG_S3_BUCKET` | S3 bucket when S3 storage is enabled |
-| `PRAYOG_S3_PREFIX` | Object-key prefix; defaults to `prayog-artifacts` |
-| `PRAYOG_S3_REGION` / `AWS_DEFAULT_REGION` | S3 region |
-| `PRAYOG_S3_ENDPOINT_URL` | Optional S3-compatible endpoint |
-| `PRAYOG_S3_SERVER_SIDE_ENCRYPTION` | Server-side encryption setting; defaults to `AES256` |
-| `PRAYOG_API_URL` | Base URL used by the ML Flow CLI |
-| `PRAYOG_TOKEN` | Existing user bearer token used by the ML Flow CLI |
-| `PRAYOG_WORKER_IMAGE` | Administrator-managed local Docker runtime image override |
-| `PRAYOG_WORKER_TIMEOUT_SECONDS` | Worker execution timeout (documented range: 1–1800 seconds) |
-| `PRAYOG_NODE_CAPABILITY_INVENTORY` | JSON inventory of provisioned node capabilities and GPU units; unset disables impossible-job cancellation |
-| `PRAYOG_OUTBOX_HANDLER_MODULE` | Python module exporting the required outbox `HANDLERS` mapping |
-| `PRAYOG_OUTBOX_POLL_SECONDS` | Outbox worker polling interval (1–60 seconds) |
-| `PRAYOG_OUTBOX_WORKER_ID` | Optional operator-defined outbox worker identifier |
+| Database | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_DB` |
+| Auth | `JWT_SECRET_KEY` |
+| Steward | `STEWARD_ENABLED`, `STEWARD_DB_USER`, `STEWARD_DB_PASSWORD`, `STEWARD_RUNTIME_URL`, `STEWARD_PUBLIC_BASE_URL`, `STEWARD_SEARCH_PROVIDER` |
+| Steward Runtime | `STEWARD_REASONING` (`claude` \| `heuristic` \| `stub`), `STEWARD_MODEL`, `ANTHROPIC_API_KEY` |
+| Scheduler | Any field of `SchedulerConfig` in `backend/logic/scheduler/config.py`, as `PRAYOG_SCHED_<FIELD>`. For example, `PRAYOG_SCHED_MAX_WALLTIME_MINUTES=180`. |
 
-The ML Flow guide documents additional worker and storage behavior. Configure only the variables needed for the services being run.
+The scheduler checks its configuration when it starts. An unknown variable, a non-numeric value, or a combination that breaks an invariant (for example, a heartbeat timeout shorter than three heartbeat intervals) stops startup with a message naming the problem.
 
-## Security and operational notes
+## API overview
 
-- Never commit `.env`, JWTs, enrollment tokens, node credentials, AWS credentials, source archives, model weights, or diagnostic logs.
-- Use HTTPS and strong environment-specific secrets outside local development.
-- Keep artifact buckets and artifact volumes private; do not expose them as static web directories.
-- User resources are owner-scoped. Administrative and professor access is role-restricted.
-- Submitted project code runs only in the separate restricted Docker worker, not inside the API process.
-- Do not install arbitrary user dependencies at execution time or enable network access for submitted jobs.
-- Diagnostic links are short-lived, single-use retrieval capabilities for verified logs from failed rebuilds. They are not a trigger for AI diagnosis and must be treated as secrets.
-- The transactional outbox enforces event eligibility and delivery safeguards, but live AI consumers and production service authentication still need to be configured.
-- Back up PostgreSQL and artifact storage together. A database snapshot without its referenced artifact objects may not be sufficient to reproduce a run.
+Every protected endpoint takes `Authorization: Bearer <token>` from `/auth/login`. Node-agent endpoints take `X-Node-Credential` instead. Every error response has a `detail` field.
 
-## Detailed documentation
+| Area | Endpoints | Who |
+|---|---|---|
+| Health and metrics | `GET /health`, `GET /metrics` | anyone |
+| Auth | `POST /auth/register`, `POST /auth/login`, `POST /auth/logout`, `GET /auth/me` | anyone / logged in |
+| Professors | `GET /professors`, `POST /professors` | logged in / ADMIN |
+| Access requests | `POST /access-requests`, `GET /access-requests/me`, `GET /access-requests`, `GET /access-requests/{id}`, `POST /access-requests/{id}/decision`, `POST /access-requests/{id}/revoke` | students and researchers request; professors and admins decide; admins revoke |
+| Jobs | `POST /jobs`, `GET /jobs/quota`, `GET /jobs/{id}`, `PATCH /jobs/{id}`, `POST /jobs/{id}/cancel` | logged in |
+| GPU pool (admin) | `/admin/nodes` (register, list, drain, return, decommission, escalate, unit count), `/admin/alerts`, `/admin/maintenance` (preview, book, change, cancel) | ADMIN |
+| Node agent | `POST /agent/enrol`, `POST /agent/heartbeat`, `GET /agent/allocations`, `POST /agent/allocations/{id}/acknowledge`, `POST /agent/allocations/{id}/report` | node credential |
+| Rebuilds | `POST /rebuilds`, `GET /rebuilds`, `GET /rebuilds/{id}` | logged in |
+| Experiment Ledger | `/mlflow/*` (projects, models, experiments, runs, metrics, artifacts, snapshots, rebuilds, handover), `/mlflow/professor/*`, `/admin/mlflow/overview` | logged in / PROFESSOR / ADMIN; see [backend/ML_FLOW.md](backend/ML_FLOW.md) |
+| Steward | `/steward/runs/…/diagnoses`, `/steward/proposals`, `/steward/attempts/…/link`, `/steward/s3/*`, `/steward/attempts/…/optimize`, `/steward/admin/*` | see [API_STEWARD.md](API_STEWARD.md) |
 
-- [ML Flow lifecycle, CLI, artifacts, snapshots, and workers](backend/ML_FLOW.md)
-- [Steward diagnosis and optimization integration contract](backend/AI_INTEGRATION.md)
-- [Node-agent enrollment and authentication](backend/NODE_AGENT_ENROLLMENT.md)
-- [Backend test suite](backend/tests/README.md)
-- [Deliverable 2 package and implementation traceability](DELIVERABLE_2_PACKAGE.md)
+Full request and response formats are in [API.md](API.md) and [API_STEWARD.md](API_STEWARD.md).
+
+## Status
+
+**Working and tested.** Authentication, two-step access approval, the GPU scheduler (classes, fair-share scoring, dispatch, reaper, drain and maintenance), the simulated node agent, and the Steward contexts S1–S4 with the heuristic adapter. As of 2026-10-15, 16 end-to-end backend tests and 222 Steward tests pass on PostgreSQL. Those tests are kept outside this repository; the Experiment Ledger and scheduler-admin tests are in `backend/tests` and run in CI (`.github/workflows/mlflow-validation.yml`).
+
+**Sign-in rules:** ten failed sign-ins in a row lock an account for 15 minutes, even for the right password, and the answer never reveals it (FR-AUTH-60). Sign-ins, lockouts and logouts go to the audit log. Creating projects, uploading and queueing need approved access; reading your own records does not.
+
+**Not built yet, or interim:**
+
+- **Labs** have no API yet. `seed_dev` inserts them directly. A user's scheduling context is created when their access request is approved: `COURSE_PROJECT` gives a course account in the central lab, `RESEARCH_PROJECT` a research account in the supervising professor's lab (set `lab_id` when creating the professor).
+- **Password reset emails.** The reset works, but without `SMTP_*` settings in `.env` the OTP is printed in the API terminal instead of being emailed.
+- **Real node execution.** The node agent in this repo is simulated. It does not start containers or touch real GPUs.
+- **Steward and ledger wiring.** The Experiment Ledger is in the repository, but the Steward still uses interim adapters: projects are scoped to their owner and `run_logs` holds the log tail.
+- **Not yet verified.** A live Claude call, the Docker image, and the S1 accuracy evaluation on real, hand-labelled failed runs. `steward/eval/` currently holds a synthetic seed set.
+
+## Further documentation
+
+- [API.md](API.md): health, authentication and authorisation endpoints
+- [API_STEWARD.md](API_STEWARD.md): rebuild and Steward endpoints
+- [backend/ML_FLOW.md](backend/ML_FLOW.md): the Experiment Ledger lifecycle, artifacts, snapshots, rebuilds, the CLI and the isolated rebuild worker
+- [backend/AI_INTEGRATION.md](backend/AI_INTEGRATION.md): the ledger outbox and the contract for Steward consumers
+- [steward/DESIGN.md](steward/DESIGN.md): the Steward's design, security model, database layout, knowledge base and design decisions
