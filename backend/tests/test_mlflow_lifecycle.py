@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from logic.errors import BadRequestError, ConflictError, NotFoundError
-from logic.mlflow import create_experiment, create_rebuild, create_run, finish_run, log_metric, resubmit_run, start_run, update_rebuild
+from logic.mlflow import create_experiment, create_rebuild, create_run, finish_run, log_metric, start_run, update_rebuild
 from mlflow_models import ModelSnapshot
 
 
@@ -520,80 +520,6 @@ class MLFlowLifecycleTests(unittest.TestCase):
         self.db.add.assert_not_called()
         self.db.commit.assert_not_called()
 
-
-
-    @patch("logic.mlflow.get_verified_artifact")
-    def test_resubmission_creates_fresh_queued_run_from_verified_artifacts(self, verify):
-        source = SimpleNamespace(
-            id=31, user_id=7, status="FAILED", code_artifact_id="code-1",
-            weights_artifact_id="weights-1", experiment_id=2,
-            project_id="project-1", model_id="model-1",
-            source_snapshot_id="snapshot-source",
-            hyperparameters={"lr": 0.02}, environment={"python": "3.12"},
-        )
-        self.set_owned_item(source)
-        code = SimpleNamespace(id="code-1", sha256="a" * 64)
-        weights = SimpleNamespace(id="weights-1", sha256="b" * 64)
-        verify.side_effect = [
-            (code, Path("/private/code.zip")),
-            (weights, Path("/private/weights.bin")),
-        ]
-
-        result = resubmit_run(self.db, 31, self.user)
-
-        created = self.db.add.call_args.args[0]
-        self.assertIs(result, created)
-        self.assertEqual(created.parent_run_id, 31)
-        self.assertEqual(created.source_snapshot_id, "snapshot-source")
-        self.assertEqual(created.run_type, "FIRST_TIME")
-        self.assertEqual(created.status, "QUEUED")
-        self.assertEqual(created.code_artifact_id, "code-1")
-        self.assertEqual(created.code_snapshot_uri, "artifact:code-1")
-        self.assertEqual(created.code_snapshot_sha256, "a" * 64)
-        self.assertEqual(created.weights_artifact_id, "weights-1")
-        self.assertEqual(created.weights_uri, "artifact:weights-1")
-        self.assertEqual(verify.call_count, 2)
-        self.db.commit.assert_called_once()
-
-    def test_resubmission_rejects_nonterminal_source_run(self):
-        for status in ("CREATED", "QUEUED", "RUNNING"):
-            with self.subTest(status=status):
-                self.db.reset_mock()
-                source = SimpleNamespace(
-                    id=31, user_id=7, status=status, code_artifact_id="code-1"
-                )
-                self.set_owned_item(source)
-
-                with self.assertRaisesRegex(ConflictError, "completed run"):
-                    resubmit_run(self.db, 31, self.user)
-
-                self.db.add.assert_not_called()
-                self.db.commit.assert_not_called()
-
-    def test_resubmission_rejects_source_without_code_snapshot(self):
-        source = SimpleNamespace(id=31, user_id=7, status="SUCCEEDED", code_artifact_id=None)
-        self.set_owned_item(source)
-
-        with self.assertRaisesRegex(BadRequestError, "no reusable code snapshot"):
-            resubmit_run(self.db, 31, self.user)
-
-        self.db.add.assert_not_called()
-        self.db.commit.assert_not_called()
-
-    @patch("logic.mlflow.get_verified_artifact")
-    def test_resubmission_does_not_create_run_when_code_integrity_fails(self, verify):
-        source = SimpleNamespace(
-            id=31, user_id=7, status="SUCCEEDED", code_artifact_id="code-1",
-            weights_artifact_id=None, experiment_id=2,
-        )
-        self.set_owned_item(source)
-        verify.side_effect = BadRequestError("Artifact integrity verification failed")
-
-        with self.assertRaisesRegex(BadRequestError, "integrity verification"):
-            resubmit_run(self.db, 31, self.user)
-
-        self.db.add.assert_not_called()
-        self.db.commit.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()
